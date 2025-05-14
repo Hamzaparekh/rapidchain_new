@@ -2,10 +2,9 @@ package main
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
+	"encoding/csv"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"net"
 	"net/rpc"
@@ -18,244 +17,177 @@ import (
 	"github.com/korkmazkadir/rapidchain/consensus"
 	"github.com/korkmazkadir/rapidchain/network"
 	"github.com/korkmazkadir/rapidchain/registery"
+	"github.com/shirou/gopsutil/process"
 )
 
-func main() {
+const outputDir = "./performance_logs"
 
-	hostname := getEnvWithDefault("NODE_HOSTNAME", "127.0.0.1")
-	registryAddress := getEnvWithDefault("REGISTRY_ADDRESS", "localhost:1234")
+func main() {
+	hostname := getEnv("NODE_HOSTNAME", "127.0.0.1")
+	registryAddress := getEnv("REGISTRY_ADDRESS", "localhost:1234")
 
 	demux := common.NewDemultiplexer(0)
 	server := network.NewServer(demux)
+	rpc.Register(server)
 
-	err := rpc.Register(server)
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:", hostname))
 	if err != nil {
-		panic(err)
+		log.Fatal("listen error:", err)
 	}
+	log.Printf("✅ Node started at %s\n", listener.Addr())
 
-	rpc.HandleHTTP()
-	l, e := net.Listen("tcp", fmt.Sprintf("%s:", hostname))
-	if e != nil {
-		log.Fatal("listen error:", e)
-	}
-
-	// start serving
 	go func() {
 		for {
-			conn, _ := l.Accept()
-			go func() {
-				rpc.ServeConn(conn)
-			}()
+			conn, _ := listener.Accept()
+			go rpc.ServeConn(conn)
 		}
 	}()
 
-	log.Printf("p2p server started on %s\n", l.Addr().String())
-	nodeInfo := getNodeInfo(l.Addr().String())
-
+	nodeInfo := getNodeInfo(listener.Addr().String())
 	registry := registery.NewRegistryClient(registryAddress, nodeInfo)
-
 	nodeInfo.ID = registry.RegisterNode()
-	log.Printf("node registeration successful, assigned ID is %d\n", nodeInfo.ID)
+	log.Printf("🆔 Registered as node ID: %d", nodeInfo.ID)
 
-	nodeConfig := registry.GetConfig()
-
-	var nodeList []registery.NodeInfo
-
+	config := registry.GetConfig()
 	for {
-		nodeList = registry.GetNodeList()
-		nodeCount := len(nodeList)
-		if nodeCount == nodeConfig.NodeCount {
+		nodes := registry.GetNodeList()
+		if len(nodes) == config.NodeCount {
+			log.Printf("✅ All %d nodes registered", config.NodeCount)
 			break
 		}
+		log.Printf("⏳ Waiting for all nodes (%d/%d)", len(nodes), config.NodeCount)
 		time.Sleep(2 * time.Second)
-		log.Printf("received node list %d/%d\n", nodeCount, nodeConfig.NodeCount)
 	}
 
-	peerSet := createPeerSet(nodeList, nodeConfig.GossipFanout, nodeInfo)
 	statLogger := common.NewStatLogger(nodeInfo.ID)
-	rapidchain := consensus.NewRapidchain(demux, nodeConfig, peerSet, statLogger)
+	peers := createPeerSet(registry.GetNodeList(), config.GossipFanout, nodeInfo)
+	rc := consensus.NewRapidchain(demux, config, peers, statLogger)
 
-	runConsensus(rapidchain, nodeConfig.EndRound, nodeInfo.ID, nodeConfig.NodeCount, nodeConfig.LeaderCount, nodeConfig.BlockSize, nodeList)
-
-	// collects stats abd uploads to registry
-	log.Printf("uploading stats to the registry\n")
-	events := statLogger.GetEvents()
-	statList := common.StatList{IPAddress: nodeInfo.IPAddress, PortNumber: nodeInfo.PortNumber, NodeID: nodeInfo.ID, Events: events}
-	registry.UploadStats(statList)
-
-	log.Printf("reached target round count. Shutting down in 5 minute\n")
-	time.Sleep(5 * time.Minute)
-
-	log.Printf("exiting as expected...\n")
+	runBenchmark(rc, config, nodeInfo.ID, registry.GetNodeList())
+	log.Println("✅ Benchmark complete.")
 }
 
-func createPeerSet(nodeList []registery.NodeInfo, fanOut int, nodeInfo registery.NodeInfo) network.PeerSet {
+func runBenchmark(rc *consensus.RapidchainConsensus, config registery.NodeConfig, nodeID int, nodeList []registery.NodeInfo) {
+	os.MkdirAll(outputDir, os.ModePerm)
+	process, _ := process.NewProcess(int32(os.Getpid()))
+	filePath := fmt.Sprintf("%s/node_%d_metrics.csv", outputDir, nodeID)
 
-	var copyNodeList []registery.NodeInfo
-	copyNodeList = append(copyNodeList, nodeList...)
-
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(copyNodeList), func(i, j int) { copyNodeList[i], copyNodeList[j] = copyNodeList[j], copyNodeList[i] })
-
-	peerSet := network.PeerSet{}
-
-	peerCount := 0
-	for i := 0; i < len(copyNodeList); i++ {
-
-		if peerCount == fanOut {
-			break
-		}
-
-		peer := copyNodeList[i]
-		if peer.ID == nodeInfo.ID || peer.IPAddress == nodeInfo.IPAddress {
-			continue
-		}
-
-		err := peerSet.AddPeer(peer.IPAddress, peer.PortNumber)
-		if err != nil {
-			panic(err)
-		}
-		log.Printf("new peer added: %s:%d ID %d\n", peer.IPAddress, peer.PortNumber, peer.ID)
-		peerCount++
-	}
-
-	return peerSet
-}
-
-func getNodeInfo(netAddress string) registery.NodeInfo {
-	tokens := strings.Split(netAddress, ":")
-
-	ipAddress := tokens[0]
-	portNumber, err := strconv.Atoi(tokens[1])
+	file, err := os.Create(filePath)
 	if err != nil {
-		panic(err)
+		log.Fatal("CSV creation failed:", err)
 	}
+	defer file.Close()
 
-	return registery.NodeInfo{IPAddress: ipAddress, PortNumber: portNumber}
-}
+	writer := csv.NewWriter(file)
+	writer.Write([]string{"Round", "IsLeader", "PayloadSize", "Latency(s)", "CPU(%)", "Memory(MB)"})
 
-func runConsensus(rc *consensus.RapidchainConsensus, numberOfRounds int, nodeID int, nodeCount int, leaderCount int, blockSize int, nodeList []registery.NodeInfo) {
+	payloadSizes := []int{64, 128, 256, 512, 1024}
 
-	time.Sleep(5 * time.Second)
-	log.Println("Consensus started")
+	previousBlock := []common.Block{{Issuer: []byte("genesis"), Round: 0, Payload: []byte("start")}}
 
-	// genesis block
-	previousBlock := []common.Block{{Issuer: []byte("initial block"), Round: 0, Payload: []byte("hello world")}}
+	round := 1
+	for _, payloadSize := range payloadSizes {
+		for r := 0; r < config.EndRound; r++ {
+			log.Printf("🔁 Round %d - Payload %dB", round, payloadSize)
 
-	currentRound := 1
-	for currentRound <= numberOfRounds {
+			isLeader := isElectedAsLeader(nodeList, round, nodeID, config.LeaderCount)
+			var blocks []common.Block
 
-		log.Printf("+++++++++ Round %d +++++++++++++++\n", currentRound)
+			payload := make([]byte, payloadSize)
+			rand.Read(payload)
 
-		var block []common.Block
+			block := common.Block{
+				Round:         round,
+				Issuer:        []byte{byte(nodeID)},
+				Payload:       payload,
+				PrevBlockHash: hashBlock(previousBlock),
+			}
 
-		if isElectedAsLeader(nodeList, currentRound, nodeID, leaderCount) {
-			log.Println("elected as leader")
-			b := createBlock(currentRound, nodeID, hashBlock(previousBlock), blockSize, leaderCount)
+			start := time.Now()
+			if isLeader {
+				blocks = rc.Propose(round, block, hashBlock(previousBlock))
+			} else {
+				blocks = rc.Decide(round, hashBlock(previousBlock))
+			}
+			elapsed := time.Since(start).Seconds()
 
-			block = rc.Propose(currentRound, b, hashBlock(previousBlock))
+			mem, _ := process.MemoryInfo()
+			cpu, _ := process.CPUPercent()
+			memMB := float64(mem.RSS) / 1024.0 / 1024.0
 
-		} else {
+			writer.Write([]string{
+				strconv.Itoa(round),
+				strconv.FormatBool(isLeader),
+				strconv.Itoa(payloadSize),
+				fmt.Sprintf("%.6f", elapsed),
+				fmt.Sprintf("%.2f", cpu),
+				fmt.Sprintf("%.2f", memMB),
+			})
+			writer.Flush()
 
-			block = rc.Decide(currentRound, hashBlock(previousBlock))
-
+			previousBlock = blocks
+			round++
+			time.Sleep(500 * time.Millisecond)
 		}
-
-		payloadSize := 0
-		for i := range block {
-			payloadSize += len(block[i].Payload)
-		}
-
-		log.Printf("appended payload size is %d bytes\n", payloadSize)
-
-		previousBlock = block
-		//log.Printf("decided block hash %x\n", encodeBase64(block.Hash()[:15]))
-
-		currentRound++
-		//time.Sleep(2 * time.Second)
-
-		log.Printf("Appended block: %x\n", encodeBase64(hashBlock(block)[:15]))
-
 	}
 
+	log.Printf("📄 Metrics saved to: %s", filePath)
 }
 
-func hashBlock(blocks []common.Block) []byte {
-
-	if len(blocks) == 1 {
-		return blocks[0].Hash()
-	}
-
-	var hashSlice []byte
-	for i := range blocks {
-		hashSlice = append(hashSlice, blocks[i].Hash()...)
-	}
-
-	h := sha256.New()
-	_, err := h.Write(hashSlice)
-	if err != nil {
-		panic(err)
-	}
-
-	return h.Sum(nil)
-}
-
-// utils
-
-func createBlock(round int, nodeID int, previousBlockHash []byte, blockSize int, leaderCount int) common.Block {
-
-	payloadSize := int(math.Ceil(float64(blockSize) / float64(leaderCount)))
-
-	block := common.Block{
-		Round:         round,
-		Issuer:        []byte{byte(nodeID)},
-		Payload:       getRandomByteSlice(payloadSize),
-		PrevBlockHash: previousBlockHash,
-	}
-
-	return block
-}
-
-func encodeBase64(hex []byte) string {
-	return base64.StdEncoding.EncodeToString([]byte(hex))
-}
-
-func getRandomByteSlice(size int) []byte {
-	data := make([]byte, size)
-	_, err := rand.Read(data)
-	if err != nil {
-		panic(err)
-	}
-	return data
-}
-
-func getEnvWithDefault(key string, defaultValue string) string {
+func getEnv(key, fallback string) string {
 	val := os.Getenv(key)
-	if len(val) == 0 {
-		val = defaultValue
+	if val == "" {
+		return fallback
 	}
-
-	log.Printf("%s=%s\n", key, val)
 	return val
 }
 
-func isElectedAsLeader(nodeList []registery.NodeInfo, round int, nodeID int, leaderCount int) bool {
+func getNodeInfo(addr string) registery.NodeInfo {
+	parts := strings.Split(addr, ":")
+	port := 0
+	fmt.Sscanf(parts[len(parts)-1], "%d", &port)
+	return registery.NodeInfo{IPAddress: parts[0], PortNumber: port}
+}
 
-	// assumes that node list is same for all nodes
-	// shuffle the node list using round number as the source of randomness
+func createPeerSet(nodes []registery.NodeInfo, fanout int, self registery.NodeInfo) network.PeerSet {
+	peers := network.PeerSet{}
+	count := 0
+	for _, n := range nodes {
+		if n.ID != self.ID {
+			if err := peers.AddPeer(n.IPAddress, n.PortNumber); err == nil {
+				log.Printf("🔗 Connected to peer: %s:%d", n.IPAddress, n.PortNumber)
+				count++
+				if count >= fanout {
+					break
+				}
+			}
+		}
+	}
+	return peers
+}
+
+func isElectedAsLeader(nodeList []registery.NodeInfo, round, nodeID, leaderCount int) bool {
 	rand.Seed(int64(round))
 	rand.Shuffle(len(nodeList), func(i, j int) { nodeList[i], nodeList[j] = nodeList[j], nodeList[i] })
 
-	var electedLeaders []int
-	for i := 0; i < leaderCount; i++ {
-		electedLeaders = append(electedLeaders, nodeList[i].ID)
+	for i := 0; i < leaderCount && i < len(nodeList); i++ {
 		if nodeList[i].ID == nodeID {
-			log.Println("elected as leader")
+			log.Println("🌟 Elected as leader")
 			return true
 		}
 	}
-
-	log.Printf("Elected leaders: %v\n", electedLeaders)
-
 	return false
+}
+
+func hashBlock(blocks []common.Block) []byte {
+	if len(blocks) == 1 {
+		return blocks[0].Hash()
+	}
+	concat := []byte{}
+	for _, b := range blocks {
+		concat = append(concat, b.Hash()...)
+	}
+	h := sha256.New()
+	h.Write(concat)
+	return h.Sum(nil)
 }
