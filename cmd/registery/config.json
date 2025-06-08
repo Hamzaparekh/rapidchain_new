@@ -5,5 +5,5 @@
   "GossipFanout": 1,
   "LeaderCount" : 1,
   "BlockSize": 512,
-  "BlockChunkCount": 4
+  "BlockChunkCount": 1
 }
