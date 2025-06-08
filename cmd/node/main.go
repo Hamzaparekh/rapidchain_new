@@ -20,7 +20,7 @@ import (
 	"github.com/shirou/gopsutil/process"
 )
 
-const outputDir = "./performance_logs"
+const outputDir = "/Users/hamzaparekh/Projects/Results"
 
 func main() {
 	hostname := getEnv("NODE_HOSTNAME", "127.0.0.1")
@@ -79,27 +79,35 @@ func runBenchmark(rc *consensus.RapidchainConsensus, config registery.NodeConfig
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
-	writer.Write([]string{"Round", "IsLeader", "PayloadSize", "Latency(s)", "CPU(%)", "Memory(MB)"})
+	// Added "TxCount" and "Throughput(Tx/s)" columns
+	writer.Write([]string{"Round", "IsLeader", "PayloadSize", "TxCount", "Latency(s)", "CPU(%)", "Memory(MB)", "Throughput(Tx/s)"})
 
-	payloadSizes := []int{64, 128, 256, 512, 1024}
+	// Keep original payloadSizes loop so we test multiple sizes
+	payloadSizes := []int{64, 128, 256, 512, 1024, 2048, 4096, 8192}
+	const txCount = 5 // Number of transactions (payloads) per block
 
 	previousBlock := []common.Block{{Issuer: []byte("genesis"), Round: 0, Payload: []byte("start")}}
 
 	round := 1
 	for _, payloadSize := range payloadSizes {
 		for r := 0; r < config.EndRound; r++ {
-			log.Printf("🔁 Round %d - Payload %dB", round, payloadSize)
+			log.Printf("🔁 Round %d - Payload %dB × %d tx", round, payloadSize, txCount)
 
 			isLeader := isElectedAsLeader(nodeList, round, nodeID, config.LeaderCount)
 			var blocks []common.Block
 
-			payload := make([]byte, payloadSize)
-			rand.Read(payload)
+			// Generate and concatenate txCount separate payloads of size payloadSize
+			var combinedPayload []byte
+			for i := 0; i < txCount; i++ {
+				chunk := make([]byte, payloadSize)
+				rand.Read(chunk)
+				combinedPayload = append(combinedPayload, chunk...)
+			}
 
 			block := common.Block{
 				Round:         round,
 				Issuer:        []byte{byte(nodeID)},
-				Payload:       payload,
+				Payload:       combinedPayload,
 				PrevBlockHash: hashBlock(previousBlock),
 			}
 
@@ -115,13 +123,17 @@ func runBenchmark(rc *consensus.RapidchainConsensus, config registery.NodeConfig
 			cpu, _ := process.CPUPercent()
 			memMB := float64(mem.RSS) / 1024.0 / 1024.0
 
+			throughput := float64(txCount) / elapsed
+
 			writer.Write([]string{
 				strconv.Itoa(round),
 				strconv.FormatBool(isLeader),
-				strconv.Itoa(payloadSize),
-				fmt.Sprintf("%.6f", elapsed),
-				fmt.Sprintf("%.2f", cpu),
-				fmt.Sprintf("%.2f", memMB),
+				strconv.Itoa(payloadSize),       // total block payload size
+				strconv.Itoa(txCount),           // number of tx in block
+				fmt.Sprintf("%.6f", elapsed),    // latency in seconds
+				fmt.Sprintf("%.2f", cpu),        // CPU %
+				fmt.Sprintf("%.2f", memMB),      // Memory MB
+				fmt.Sprintf("%.2f", throughput), // throughput (tx/s)
 			})
 			writer.Flush()
 
