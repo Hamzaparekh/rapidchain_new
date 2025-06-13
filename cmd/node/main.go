@@ -34,7 +34,7 @@ func main() {
 	if err != nil {
 		log.Fatal("listen error:", err)
 	}
-	log.Printf("✅ Node started at %s\n", listener.Addr())
+	log.Printf("Node started at %s\n", listener.Addr())
 
 	go func() {
 		for {
@@ -79,12 +79,11 @@ func runBenchmark(rc *consensus.RapidchainConsensus, config registery.NodeConfig
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
-	// Added "TxCount" and "Throughput(Tx/s)" columns
+
 	writer.Write([]string{"Round", "IsLeader", "PayloadSize", "TxCount", "Latency(s)", "CPU(%)", "Memory(MB)", "Throughput(Tx/s)"})
 
-	// Keep original payloadSizes loop so we test multiple sizes
 	payloadSizes := []int{64, 128, 256, 512, 1024, 2048, 4096, 8192}
-	const txCount = 5 // Number of transactions (payloads) per block
+	const txCount = 5
 
 	previousBlock := []common.Block{{Issuer: []byte("genesis"), Round: 0, Payload: []byte("start")}}
 
@@ -96,7 +95,6 @@ func runBenchmark(rc *consensus.RapidchainConsensus, config registery.NodeConfig
 			isLeader := isElectedAsLeader(nodeList, round, nodeID, config.LeaderCount)
 			var blocks []common.Block
 
-			// Generate and concatenate txCount separate payloads of size payloadSize
 			var combinedPayload []byte
 			for i := 0; i < txCount; i++ {
 				chunk := make([]byte, payloadSize)
